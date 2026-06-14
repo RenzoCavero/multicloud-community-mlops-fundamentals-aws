@@ -1,0 +1,5 @@
+# Tooling for CI (lint + tests). Installed on top of requirements.txt
+-r requirements.txt
+ruff>=0.4,<1
+pytest>=8.0,<9
+httpx>=0.27,<1   # used by FastAPI TestClient
