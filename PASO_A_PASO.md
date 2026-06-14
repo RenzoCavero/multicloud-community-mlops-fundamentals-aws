@@ -480,6 +480,17 @@ el progreso con:
 MSYS_NO_PATHCONV=1 aws logs tail /aws/codebuild/churn-training --follow
 ```
 
+> Si abrís una nueva terminal y perdés `$INSTANCE_ID` o `$IP`, recuperalos así:
+> ```bash
+> INSTANCE_ID=$(aws ec2 describe-instances \
+>   --filters "Name=tag:Name,Values=churn-api" \
+>             "Name=instance-state-name,Values=running" \
+>   --query 'Reservations[0].Instances[0].InstanceId' --output text)
+> IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+>   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+> echo "http://$IP:8000"
+> ```
+
 ### 6.4 Probar la API
 
 ```bash
@@ -584,6 +595,27 @@ Los workflows ya están listos en `.github/workflows/`. Para activarlos:
 Cuando termines el laboratorio, eliminá todo para no seguir gastando.
 El único recurso que cobra continuamente es **EC2** (~$0.01/hora).
 
+Primero, obtené los IDs reales (no dependas de variables de sesión anteriores):
+
+```bash
+# Recuperar IDs antes de destruir
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=churn-api" \
+            "Name=instance-state-name,Values=running,stopped" \
+  --query 'Reservations[*].Instances[*].InstanceId' --output text)
+
+SG_ID=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=churn-api-sg" \
+  --query 'SecurityGroups[0].GroupId' --output text)
+
+echo "INSTANCE_ID: $INSTANCE_ID"
+echo "SG_ID:       $SG_ID"
+echo "BUCKET:      $BUCKET"
+```
+
+> Si alguna variable queda vacía, ese recurso ya fue eliminado — podés saltear
+> el comando correspondiente.
+
 ```bash
 # 1. EC2 (lo primero, es lo que cobra)
 aws ec2 terminate-instances --instance-ids $INSTANCE_ID
@@ -592,25 +624,26 @@ aws ec2 delete-security-group --group-id $SG_ID
 
 # 2. Roles IAM de EC2
 aws iam remove-role-from-instance-profile \
-  --instance-profile-name churn-ec2-profile --role-name churn-ec2-role
-aws iam delete-instance-profile --instance-profile-name churn-ec2-profile
+  --instance-profile-name churn-ec2-profile --role-name churn-ec2-role 2>/dev/null || true
+aws iam delete-instance-profile \
+  --instance-profile-name churn-ec2-profile 2>/dev/null || true
 aws iam detach-role-policy \
   --role-name churn-ec2-role \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser 2>/dev/null || true
 aws iam delete-role-policy \
-  --role-name churn-ec2-role --policy-name churn-ec2-policy
-aws iam delete-role --role-name churn-ec2-role
+  --role-name churn-ec2-role --policy-name churn-ec2-policy 2>/dev/null || true
+aws iam delete-role --role-name churn-ec2-role 2>/dev/null || true
 
 # 3. CodeBuild + su rol
-aws codebuild delete-project --name churn-training
+aws codebuild delete-project --name churn-training 2>/dev/null || true
 aws iam delete-role-policy \
-  --role-name churn-codebuild-role --policy-name churn-codebuild-policy
-aws iam delete-role --role-name churn-codebuild-role
+  --role-name churn-codebuild-role --policy-name churn-codebuild-policy 2>/dev/null || true
+aws iam delete-role --role-name churn-codebuild-role 2>/dev/null || true
 
 # 4. ECR, DynamoDB, S3
-aws ecr delete-repository --repository-name churn-api --force
-aws dynamodb delete-table --table-name churn-model-registry
-aws s3 rb s3://$BUCKET --force
+aws ecr delete-repository --repository-name churn-api --force 2>/dev/null || true
+aws dynamodb delete-table --table-name churn-model-registry 2>/dev/null || true
+aws s3 rb s3://$BUCKET --force 2>/dev/null || true
 
 echo "Todos los recursos eliminados."
 ```
