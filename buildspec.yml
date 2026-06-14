@@ -36,9 +36,4 @@ phases:
       # Subir el historial de experimentos MLflow a S3 (tracking persistente)
       - echo "Subiendo MLflow runs a S3..."
       - aws s3 sync mlruns s3://$S3_BUCKET/mlruns/ --quiet || true
-
-artifacts:
-  files:
-    - models/**/*
-    - data/feature_store/**/*
-  name: churn-training-$(date +%Y%m%d-%H%M%S)
+      - echo "Entrenamiento y registro completados."
