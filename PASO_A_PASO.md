@@ -1,337 +1,614 @@
-# PASO A PASO — Laboratorio MLOps en AWS
+# Laboratorio MLOps en AWS — Guía paso a paso
 
-Guía de laboratorio para levantar **todo el flujo** desde cero, ejecutarlo y al
-final **destruir los recursos** para no gastar créditos.
+Reproducir el pipeline completo de extremo a extremo:
+datos crudos → entrenamiento en AWS → API de inferencia → monitoreo.
 
-- **Región:** `us-east-1`
-- **Account ID (ejemplo):** `313694531227` → reemplázalo por el tuyo
-- **Nombres de recursos** (todos parametrizables en `src/config.py`):
-  - Bucket S3: `churn-mlops-<ACCOUNT_ID>`
-  - Tabla DynamoDB: `churn-model-registry`
-  - Repo ECR: `churn-api`
-  - Proyecto CodeBuild: `churn-training`
-  - Rol CodeBuild: `churn-codebuild-role` · Rol EC2: `churn-ec2-role`
-
-> Todos los comandos usan **AWS CLI**. En Windows Git Bash, anteponé
-> `MSYS_NO_PATHCONV=1` cuando un argumento empiece con `/` (ej. ARNs de logs).
+> **Región:** `us-east-1` · **Cuenta:** `313694531227` · **Free Tier:** S3, DynamoDB, CodeBuild (100 min/mes), EC2 t3.micro
 
 ---
 
-## 0. Prerrequisitos
+## Mapa del laboratorio
 
-```bash
-aws --version                 # AWS CLI v2
-aws sts get-caller-identity   # confirma cuenta y credenciales
-python --version              # 3.11
+```
+[datos CSV]
+    │ preprocess → feature store
+    ▼
+[CodeBuild]  ←── buildspec.yml ejecuta el pipeline completo
+    │ train → evaluate → register_model
+    ▼
+[S3]  modelo .joblib + métricas   [DynamoDB]  registro de versiones
+    │                                  │
+    └──────────── EC2 ────────────────┘
+                   │  FastAPI + Docker
+                   ▼
+             /predict  /health
+                   │
+             [CloudWatch]  métricas de monitoreo
 ```
 
-Exportá variables base (se usan en todos los pasos):
+Cada bloque de comandos incluye la **salida esperada** para que sepas si está bien.
+
+---
+
+## 0. Antes de empezar
+
+Verificá que tenés todo instalado y las credenciales configuradas:
+
+```bash
+aws --version
+# AWS CLI 2.x.x
+
+aws sts get-caller-identity
+# {
+#   "Account": "313694531227",
+#   "UserId": "...",
+#   "Arn": "arn:aws:iam::313694531227:user/..."
+# }
+
+python --version
+# Python 3.11.x
+```
+
+Exportá estas variables una sola vez; se usan en todos los pasos siguientes:
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export AWS_REGION=us-east-1
 export BUCKET=churn-mlops-$ACCOUNT_ID
 echo "Bucket: $BUCKET"
+# Bucket: churn-mlops-313694531227
 ```
 
-> Si tu bucket no se llama `churn-mlops-<ACCOUNT_ID>`, editá `S3_BUCKET` en
-> `src/config.py` o exportá `S3_BUCKET=<tu-bucket>`.
+> **Windows Git Bash:** si un argumento empieza con `/` (ARNs, rutas), anteponé
+> `MSYS_NO_PATHCONV=1` al comando para que Git Bash no maniple las rutas.
 
 ---
 
-## 1. Entorno local (para entender y testear el flujo)
+## 1. Entorno local (opcional pero recomendado)
+
+Antes de subir nada a AWS, confirmá que el pipeline corre bien en tu máquina.
+Esto también ejecuta los tests y el linter.
 
 ```bash
 python -m venv .venv
-source .venv/Scripts/activate     # Linux/Mac: source .venv/bin/activate
+source .venv/Scripts/activate      # Linux/Mac: source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# Pipeline completo en local (sin AWS)
 export PYTHONPATH=src
-python src/preprocess.py
-python src/build_feature_store.py
-python src/train.py
-python src/evaluate.py
+python src/preprocess.py           # limpia el CSV crudo
+python src/build_feature_store.py  # agrega timestamp, genera features.csv
+python src/train.py                # entrena y guarda model.joblib + métricas
+python src/evaluate.py             # quality gate: falla si f1 o AUC son bajos
 
-ruff check .
-pytest
+ruff check .    # linter: sin errores
+pytest          # 7 tests, todos verdes
+```
+
+Salida esperada al final de `pytest`:
+```
+7 passed in X.XXs
 ```
 
 ---
 
-## 2. Crear la infraestructura base (S3, DynamoDB, ECR)
+## 2. Crear la infraestructura base
+
+### 2.1 Bucket S3
+
+S3 es el almacén central del proyecto: guarda el dataset, el feature store, el
+modelo entrenado, los experimentos de MLflow y los reportes de monitoreo.
 
 ```bash
-# S3 (datasets, feature store, modelos, mlruns, reportes)
 aws s3api create-bucket --bucket $BUCKET --region $AWS_REGION
+
+# Bloquear acceso público (buena práctica)
 aws s3api put-public-access-block --bucket $BUCKET \
-  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
-# Dataset crudo a S3 (también queda versionado en el repo)
-aws s3 cp data/raw/telco_customer_churn_mlops.csv s3://$BUCKET/raw/telco_customer_churn_mlops.csv
+# Subir el dataset crudo
+aws s3 cp data/raw/telco_customer_churn_mlops.csv \
+  s3://$BUCKET/raw/telco_customer_churn_mlops.csv
 
-# DynamoDB (Model Registry)
-aws dynamodb create-table --table-name churn-model-registry \
-  --attribute-definitions AttributeName=model_name,AttributeType=S AttributeName=version,AttributeType=S \
-  --key-schema AttributeName=model_name,KeyType=HASH AttributeName=version,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST --region $AWS_REGION
+# Verificar
+aws s3 ls s3://$BUCKET/
+# 2026-...  telco_customer_churn_mlops.csv
+```
 
-# ECR (imagen Docker de la API)
+### 2.2 Tabla DynamoDB (Model Registry)
+
+DynamoDB actúa como registro de modelos: guarda la versión, las métricas y el
+link al artefacto en S3. Reemplaza SageMaker Model Registry (que tiene cuotas
+más estrictas).
+
+```bash
+aws dynamodb create-table \
+  --table-name churn-model-registry \
+  --attribute-definitions \
+    AttributeName=model_name,AttributeType=S \
+    AttributeName=version,AttributeType=S \
+  --key-schema \
+    AttributeName=model_name,KeyType=HASH \
+    AttributeName=version,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --region $AWS_REGION
+
+# Salida esperada: "TableStatus": "CREATING" → en ~10 segundos pasa a ACTIVE
+```
+
+### 2.3 Repositorio ECR (imagen Docker)
+
+ECR es el registry de imágenes Docker de AWS. La imagen de la API se construye
+una vez y luego EC2 la descarga para correr el contenedor.
+
+```bash
 aws ecr create-repository --repository-name churn-api --region $AWS_REGION
+
+# Salida esperada:
+# "repositoryUri": "313694531227.dkr.ecr.us-east-1.amazonaws.com/churn-api"
 ```
 
 ---
 
-## 3. Rol IAM para CodeBuild
+## 3. Permisos IAM para CodeBuild
 
-CodeBuild necesita: escribir logs, leer/escribir el bucket y escribir en DynamoDB.
+CodeBuild necesita permiso para escribir logs, leer/escribir en S3 y registrar
+el modelo en DynamoDB. Creamos un rol específico con los mínimos permisos
+necesarios (principio de menor privilegio).
 
-`cb-trust.json`:
-```json
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-```
+```bash
+# Política de confianza: quién puede asumir este rol
+cat > /tmp/cb-trust.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "codebuild.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
 
-`cb-policy.json` (reemplazá `<ACCOUNT_ID>`):
-```json
+# Permisos del rol
+cat > /tmp/cb-policy.json <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
-    {"Sid":"Logs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"},
-    {"Sid":"S3","Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:ListBucket"],"Resource":["arn:aws:s3:::churn-mlops-<ACCOUNT_ID>","arn:aws:s3:::churn-mlops-<ACCOUNT_ID>/*"]},
-    {"Sid":"DynamoDB","Effect":"Allow","Action":["dynamodb:PutItem","dynamodb:GetItem","dynamodb:Query","dynamodb:DescribeTable","dynamodb:CreateTable"],"Resource":["arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/churn-model-registry","arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/churn-model-registry/*"]}
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject","s3:PutObject","s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::churn-mlops-$ACCOUNT_ID",
+        "arn:aws:s3:::churn-mlops-$ACCOUNT_ID/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDB",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem","dynamodb:GetItem","dynamodb:Query","dynamodb:DescribeTable","dynamodb:CreateTable"],
+      "Resource": "arn:aws:dynamodb:$AWS_REGION:$ACCOUNT_ID:table/churn-model-registry"
+    }
   ]
 }
-```
+EOF
 
-```bash
-aws iam create-role --role-name churn-codebuild-role \
-  --assume-role-policy-document file://cb-trust.json
-aws iam put-role-policy --role-name churn-codebuild-role \
-  --policy-name churn-codebuild-policy --policy-document file://cb-policy.json
+aws iam create-role \
+  --role-name churn-codebuild-role \
+  --assume-role-policy-document file:///tmp/cb-trust.json
+
+aws iam put-role-policy \
+  --role-name churn-codebuild-role \
+  --policy-name churn-codebuild-policy \
+  --policy-document file:///tmp/cb-policy.json
 ```
 
 ---
 
-## 4. Proyecto CodeBuild = entrenamiento en AWS
+## 4. Proyecto CodeBuild (entrenamiento en la nube)
 
-CodeBuild ejecuta `buildspec.yml` (preprocess → feature store → train → evaluate →
-register). Hay dos formas de darle el código fuente:
+CodeBuild ejecuta `buildspec.yml`, que corre los 5 pasos del pipeline
+(preprocess → feature store → train → evaluate → register_model) dentro de un
+contenedor Linux gestionado por AWS. Reemplaza SageMaker Training Jobs.
 
-### Opción A — Fuente en S3 (rápida, sin GitHub; ideal para probar ya)
+### 4.1 Empaquetar y subir el código fuente a S3
 
 ```bash
-# Empaquetar el repo (solo archivos versionados) y subirlo
-git archive --format=zip HEAD -o source.zip
-aws s3 cp source.zip s3://$BUCKET/source/source.zip && rm source.zip
+git archive --format=zip HEAD -o /tmp/source.zip
+aws s3 cp /tmp/source.zip s3://$BUCKET/source/source.zip
+
+# Salida esperada:
+# upload: /tmp/source.zip to s3://churn-mlops-313694531227/source/source.zip
 ```
 
-`codebuild.json` (reemplazá `<ACCOUNT_ID>`):
-```json
+### 4.2 Crear el proyecto CodeBuild
+
+```bash
+cat > /tmp/codebuild.json <<EOF
 {
   "name": "churn-training",
-  "source": { "type": "S3", "location": "churn-mlops-<ACCOUNT_ID>/source/source.zip", "buildspec": "buildspec.yml" },
+  "source": {
+    "type": "S3",
+    "location": "churn-mlops-$ACCOUNT_ID/source/source.zip",
+    "buildspec": "buildspec.yml"
+  },
   "artifacts": { "type": "NO_ARTIFACTS" },
   "environment": {
     "type": "LINUX_CONTAINER",
     "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
     "computeType": "BUILD_GENERAL1_SMALL",
     "environmentVariables": [
-      { "name": "S3_BUCKET", "value": "churn-mlops-<ACCOUNT_ID>" },
-      { "name": "AWS_REGION", "value": "us-east-1" }
+      { "name": "S3_BUCKET",    "value": "churn-mlops-$ACCOUNT_ID" },
+      { "name": "AWS_REGION",   "value": "us-east-1" }
     ]
   },
-  "serviceRole": "arn:aws:iam::<ACCOUNT_ID>:role/churn-codebuild-role",
+  "serviceRole": "arn:aws:iam::$ACCOUNT_ID:role/churn-codebuild-role",
   "timeoutInMinutes": 20
 }
+EOF
+
+aws codebuild create-project \
+  --cli-input-json file:///tmp/codebuild.json \
+  --region $AWS_REGION
 ```
 
-```bash
-aws codebuild create-project --cli-input-json file://codebuild.json --region $AWS_REGION
+### 4.3 Lanzar el entrenamiento
 
-# Lanzar el entrenamiento y seguir el estado
-BUILD_ID=$(aws codebuild start-build --project-name churn-training --query 'build.id' --output text)
-aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].buildStatus'
+```bash
+BUILD_ID=$(aws codebuild start-build \
+  --project-name churn-training \
+  --query 'build.id' --output text)
+
+echo "Build en curso: $BUILD_ID"
+
+# Seguir el estado hasta que cambie a SUCCEEDED o FAILED
+watch -n 15 "aws codebuild batch-get-builds \
+  --ids '$BUILD_ID' \
+  --query 'builds[0].buildStatus' --output text"
+
+# Ver logs en tiempo real (Git Bash: prefijá MSYS_NO_PATHCONV=1)
+MSYS_NO_PATHCONV=1 aws logs tail /aws/codebuild/churn-training --follow
 ```
 
-> Cuando cambies el código, repetí el `git archive` + `aws s3 cp` y volvé a lanzar
-> el build (la fuente S3 no se actualiza sola).
+Salida esperada al terminar:
+```
+SUCCEEDED
+```
 
-### Opción B — Fuente en GitHub (para el trigger de GitHub Actions)
-
-1. Subí el repo a GitHub.
-2. En la consola: **CodeBuild → Settings → Connections → GitHub** (autorización OAuth, una sola vez).
-3. Recreá el proyecto con `"source": {"type": "GITHUB", "location": "https://github.com/<user>/<repo>.git", "buildspec": "buildspec.yml"}`.
-4. El workflow `train-codebuild.yml` lo dispara desde **Actions** (ver paso 8).
-
-### Verificar el resultado del entrenamiento
+### 4.4 Verificar que el modelo quedó registrado
 
 ```bash
-# Artefactos del modelo en S3
+# Artefactos en S3
 aws s3 ls s3://$BUCKET/models/ --recursive
-# Registry en DynamoDB (versiones del modelo)
-aws dynamodb scan --table-name churn-model-registry --query 'Items'
-# Historial de experimentos MLflow
-aws s3 ls s3://$BUCKET/mlruns/ --recursive | head
+# models/build-1/model.joblib
+# models/build-1/metrics.json
+# models/build-1/evaluation.json
+
+# Entrada en DynamoDB
+aws dynamodb scan --table-name churn-model-registry \
+  --query 'Items[*].{version:version.S, status:status.S, f1:f1.N, auc:roc_auc.N}'
+# [{"version":"build-1","status":"Production","f1":"0.7x","auc":"0.77xx"}]
 ```
 
-Ver logs del build (Git Bash necesita `MSYS_NO_PATHCONV=1`):
+> Si el build falla, revisá los logs de CloudWatch. El error más común es un
+> permiso IAM faltante o un umbral de calidad demasiado alto en `evaluate.py`.
+
+---
+
+## 5. Permisos IAM para EC2
+
+La instancia EC2 necesita descargar el modelo desde S3, consultarlo en DynamoDB
+y publicar métricas en CloudWatch. También necesita push a ECR para construir la
+imagen Docker durante el arranque (en producción, esto lo haría GitHub Actions).
+
+```bash
+cat > /tmp/ec2-trust.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+cat > /tmp/ec2-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::churn-mlops-$ACCOUNT_ID/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query","dynamodb:GetItem"],
+      "Resource": "arn:aws:dynamodb:$AWS_REGION:$ACCOUNT_ID:table/churn-model-registry"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricData"],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name churn-ec2-role \
+  --assume-role-policy-document file:///tmp/ec2-trust.json
+
+aws iam put-role-policy \
+  --role-name churn-ec2-role \
+  --policy-name churn-ec2-policy \
+  --policy-document file:///tmp/ec2-policy.json
+
+# ECR PowerUser: permite que EC2 construya y pushee la imagen Docker
+aws iam attach-role-policy \
+  --role-name churn-ec2-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+# Instance profile: es el "envoltorio" que asocia el rol a la instancia
+aws iam create-instance-profile --instance-profile-name churn-ec2-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name churn-ec2-profile \
+  --role-name churn-ec2-role
+```
+
+---
+
+## 6. EC2 con FastAPI (endpoint de inferencia)
+
+Lanzamos una instancia `t3.micro` (Free Tier). Al arrancar, el *user-data*
+(script de inicialización) instala Docker, construye la imagen de la API a
+partir del código en S3, la pushea a ECR y levanta el contenedor.
+
+### 6.1 Security Group (firewall de la instancia)
+
+Abrimos el puerto 8000 solo a tu IP pública para no exponer la API al mundo.
+
+```bash
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+echo "Tu IP: $MY_IP"
+
+SG_ID=$(aws ec2 create-security-group \
+  --group-name churn-api-sg \
+  --description "API de churn - solo mi IP" \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp --port 8000 \
+  --cidr $MY_IP/32
+
+echo "Security Group: $SG_ID"
+```
+
+### 6.2 Script de arranque (user-data)
+
+```bash
+cat > /tmp/user-data.sh <<EOF
+#!/bin/bash
+set -xe
+exec > /var/log/churn-setup.log 2>&1
+
+ACCOUNT_ID=$ACCOUNT_ID
+REGION=$AWS_REGION
+BUCKET=churn-mlops-\$ACCOUNT_ID
+ECR=\$ACCOUNT_ID.dkr.ecr.\$REGION.amazonaws.com/churn-api
+
+dnf install -y docker unzip
+systemctl enable --now docker
+
+aws ecr get-login-password --region \$REGION \\
+  | docker login --username AWS --password-stdin \\
+    \$ACCOUNT_ID.dkr.ecr.\$REGION.amazonaws.com
+
+aws s3 cp s3://\$BUCKET/source/source.zip /tmp/source.zip
+mkdir -p /tmp/app && unzip -o /tmp/source.zip -d /tmp/app
+cd /tmp/app
+
+docker build -t \$ECR:latest .
+docker push \$ECR:latest
+docker run -d --restart always -p 8000:8000 \\
+  -e AWS_REGION=\$REGION --name churn-api \$ECR:latest
+
+echo "CHURN_API_READY"
+EOF
+```
+
+### 6.3 Lanzar la instancia
+
+```bash
+# AMI de Amazon Linux 2023 (última versión, Free Tier)
+AMI=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query 'Parameter.Value' --output text)
+
+INSTANCE_ID=$(aws ec2 run-instances \
+  --image-id $AMI \
+  --instance-type t3.micro \
+  --iam-instance-profile Name=churn-ec2-profile \
+  --security-group-ids $SG_ID \
+  --user-data file:///tmp/user-data.sh \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=churn-api}]' \
+  --query 'Instances[0].InstanceId' --output text)
+
+echo "Instancia: $INSTANCE_ID"
+
+# Esperar hasta que esté corriendo
+aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+# Obtener la IP pública
+IP=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+echo "API en: http://$IP:8000"
+```
+
+La instancia tarda ~3 minutos en terminar de construir la imagen. Podés seguir
+el progreso con:
 ```bash
 MSYS_NO_PATHCONV=1 aws logs tail /aws/codebuild/churn-training --follow
 ```
 
----
-
-## 5. Rol IAM e imagen para EC2
-
-### 5.1 Rol de instancia EC2
-
-`ec2-trust.json`:
-```json
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-```
-
-`ec2-policy.json` (lectura de S3, query a DynamoDB, métricas CloudWatch):
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::churn-mlops-<ACCOUNT_ID>/*"},
-    {"Effect":"Allow","Action":["dynamodb:Query","dynamodb:GetItem"],"Resource":"arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/churn-model-registry"},
-    {"Effect":"Allow","Action":["cloudwatch:PutMetricData"],"Resource":"*"}
-  ]
-}
-```
+### 6.4 Probar la API
 
 ```bash
-aws iam create-role --role-name churn-ec2-role --assume-role-policy-document file://ec2-trust.json
-aws iam put-role-policy --role-name churn-ec2-role --policy-name churn-ec2-policy --policy-document file://ec2-policy.json
-# ECR: para CONSTRUIR/PUSHEAR desde EC2 en la demo usamos PowerUser; en el flujo
-# normal (la imagen la sube GitHub Actions) basta ReadOnly.
-aws iam attach-role-policy --role-name churn-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
-aws iam create-instance-profile --instance-profile-name churn-ec2-profile
-aws iam add-role-to-instance-profile --instance-profile-name churn-ec2-profile --role-name churn-ec2-role
-```
-
-### 5.2 Imagen Docker de la API
-
-**Flujo normal:** la sube `docker-ecr.yml` desde GitHub Actions (paso 8).
-**En la demo** (sin GitHub) la construye la propia EC2 vía *user-data* (paso 6).
-
----
-
-## 6. EC2 + Docker + FastAPI (endpoint de inferencia)
-
-> Los comandos exactos y verificados se completan en la sección final del lab.
-> La idea: lanzar una `t3.micro` con un *security group* que abra el puerto 8000
-> y un *user-data* que instale Docker, construya/baje la imagen y corra el contenedor.
-
-```bash
-# Security group con puerto 8000 abierto (demo)
-SG_ID=$(aws ec2 create-security-group --group-name churn-api-sg \
-  --description "Churn API" --query 'GroupId' --output text)
-aws ec2 authorize-security-group-ingress --group-id $SG_ID \
-  --protocol tcp --port 8000 --cidr 0.0.0.0/0
-```
-
-`user-data.sh` (instala Docker, construye la imagen y corre el contenedor):
-```bash
-#!/bin/bash
-dnf install -y docker && systemctl start docker
-ACCOUNT_ID=<ACCOUNT_ID>; REGION=us-east-1; BUCKET=churn-mlops-$ACCOUNT_ID
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-aws s3 cp s3://$BUCKET/source/source.zip /tmp/source.zip
-cd /tmp && unzip -o source.zip -d app && cd app
-docker build -t $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/churn-api:latest .
-docker push $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/churn-api:latest
-docker run -d -p 8000:8000 -e AWS_REGION=$REGION $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/churn-api:latest
-```
-
-```bash
-# Lanzar la instancia (AMI Amazon Linux 2023, Free Tier t3.micro)
-AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query 'Parameter.Value' --output text)
-INSTANCE_ID=$(aws ec2 run-instances --image-id $AMI --instance-type t3.micro \
-  --iam-instance-profile Name=churn-ec2-profile --security-group-ids $SG_ID \
-  --user-data file://user-data.sh \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=churn-api}]' \
-  --query 'Instances[0].InstanceId' --output text)
-
-# IP pública
-aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
-```
-
-### Probar la API
-
-```bash
-IP=<public-ip>
+# ¿Está viva?
 curl http://$IP:8000/health
-curl -X POST http://$IP:8000/predict -H "Content-Type: application/json" -d '{
-  "gender":"Male","contract_type":"Month-to-Month","internet_service":"Fiber",
-  "senior_citizen":0,"tenure_months":3,"monthly_charges":95.0,"support_tickets_last_6m":5}'
-# -> {"churn_prediction":1,"churn_probability":0.7x,"risk_label":"HIGH"}
+# {"status":"ok","model_type":"logistic-regression"}
+
+# Predicción de un cliente de alto riesgo
+curl -s -X POST http://$IP:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "gender": "Male",
+    "contract_type": "Month-to-Month",
+    "internet_service": "Fiber",
+    "senior_citizen": 0,
+    "tenure_months": 3,
+    "monthly_charges": 95.0,
+    "support_tickets_last_6m": 5
+  }' | python -m json.tool
+# {
+#   "churn_prediction": 1,
+#   "churn_probability": 0.8548,
+#   "risk_label": "HIGH"
+# }
+
+# Predicción de un cliente de bajo riesgo
+curl -s -X POST http://$IP:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "gender": "Female",
+    "contract_type": "Two-Year",
+    "internet_service": "DSL",
+    "senior_citizen": 0,
+    "tenure_months": 48,
+    "monthly_charges": 45.0,
+    "support_tickets_last_6m": 0
+  }' | python -m json.tool
+# {
+#   "churn_prediction": 0,
+#   "churn_probability": 0.051,
+#   "risk_label": "LOW"
+# }
+
+# Swagger UI (documentación interactiva)
+# Abrí en el navegador: http://$IP:8000/docs
 ```
 
 ---
 
 ## 7. Monitoreo (CloudWatch + S3)
 
-```bash
-# Inferencia batch sobre un CSV de clientes
-PYTHONPATH=src python src/predict.py --input data/feature_store/features.csv --output reports/predictions.csv
-# Publicar métricas a CloudWatch y subir el reporte a S3
-PYTHONPATH=src python src/monitor.py --predictions reports/predictions.csv
+`monitor.py` calcula métricas sobre las predicciones batch y las publica en
+CloudWatch. Desde la consola podés ver gráficos y crear alertas.
 
-# Ver métricas
+```bash
+# Inferencia sobre el feature store completo
+PYTHONPATH=src python src/predict.py \
+  --input data/feature_store/features.csv \
+  --output reports/predictions.csv
+
+# Publicar métricas y subir el reporte
+PYTHONPATH=src python src/monitor.py \
+  --predictions reports/predictions.csv
+
+# Verificar que las métricas llegaron
 aws cloudwatch list-metrics --namespace ChurnMLOps
+# Deberías ver: PredictedChurnRate, AvgChurnProbability, HighRiskCustomers, TotalPredictions
+
+# Ver el reporte en S3
 aws s3 ls s3://$BUCKET/reports/
+# 2026-... monitoring-YYYYMMDD-HHMMSS.json
 ```
 
-En la consola: **CloudWatch → Metrics → ChurnMLOps** (PredictedChurnRate,
-AvgChurnProbability, HighRiskCustomers). Podés crear una **alarma** si, por
-ejemplo, `HighRiskCustomers` supera un umbral (señal de posible drift).
+En la consola AWS: **CloudWatch → Métricas → ChurnMLOps**.
+Podés crear una alarma si `HighRiskCustomers` supera un umbral (señal de drift).
 
 ---
 
-## 8. GitHub Actions (CI + triggers)
+## 8. GitHub Actions (CI/CD automatizado)
 
-En GitHub → **Settings → Secrets and variables → Actions**, agregá:
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
+Los workflows ya están listos en `.github/workflows/`. Para activarlos:
 
-| Workflow | Cuándo corre | Qué hace | Semáforo |
-|---|---|---|---|
-| `ci.yml` | cada push / PR | `ruff` + `pytest` | check verde/rojo + badge en README |
-| `train-codebuild.yml` | manual (Actions) | dispara CodeBuild y transmite logs | check + link al build |
-| `docker-ecr.yml` | push a `main` o manual | build + push de la imagen a ECR | check verde/rojo |
+1. Subí el repo a GitHub.
+2. Andá a **Settings → Secrets and variables → Actions** y agregá:
+   - `AWS_ACCESS_KEY_ID`
+   - `AWS_SECRET_ACCESS_KEY`
+   - `AWS_REGION` → `us-east-1`
 
-> `train-codebuild.yml` requiere el proyecto CodeBuild con **fuente GitHub**
-> (paso 4, opción B). `docker-ecr.yml` requiere el repo ECR (paso 2).
+| Workflow | Cuándo corre | Qué hace |
+|---|---|---|
+| `ci.yml` | Cada push / PR | `ruff` + `pytest` (7 tests) |
+| `train-codebuild.yml` | Manual desde Actions | Dispara CodeBuild y transmite logs |
+| `docker-ecr.yml` | Push a `main` o manual | Build + push de la imagen a ECR |
+
+> `train-codebuild.yml` requiere cambiar la fuente del proyecto CodeBuild a
+> GitHub (en la consola: CodeBuild → churn-training → Edit → Source → GitHub).
 
 ---
 
-## 9. Destrucción de recursos (teardown)
+## 9. Destruir los recursos (teardown)
+
+Cuando termines el laboratorio, eliminá todo para no seguir gastando.
+El único recurso que cobra continuamente es **EC2** (~$0.01/hora).
 
 ```bash
-# EC2
+# 1. EC2 (lo primero, es lo que cobra)
 aws ec2 terminate-instances --instance-ids $INSTANCE_ID
-aws ec2 delete-security-group --group-id $SG_ID          # tras la terminación
+aws ec2 wait instance-terminated --instance-ids $INSTANCE_ID
+aws ec2 delete-security-group --group-id $SG_ID
 
-# IAM EC2
-aws iam remove-role-from-instance-profile --instance-profile-name churn-ec2-profile --role-name churn-ec2-role
+# 2. Roles IAM de EC2
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name churn-ec2-profile --role-name churn-ec2-role
 aws iam delete-instance-profile --instance-profile-name churn-ec2-profile
-aws iam detach-role-policy --role-name churn-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
-aws iam delete-role-policy --role-name churn-ec2-role --policy-name churn-ec2-policy
+aws iam detach-role-policy \
+  --role-name churn-ec2-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+aws iam delete-role-policy \
+  --role-name churn-ec2-role --policy-name churn-ec2-policy
 aws iam delete-role --role-name churn-ec2-role
 
-# CodeBuild + IAM
+# 3. CodeBuild + su rol
 aws codebuild delete-project --name churn-training
-aws iam delete-role-policy --role-name churn-codebuild-role --policy-name churn-codebuild-policy
+aws iam delete-role-policy \
+  --role-name churn-codebuild-role --policy-name churn-codebuild-policy
 aws iam delete-role --role-name churn-codebuild-role
 
-# ECR / DynamoDB / S3
+# 4. ECR, DynamoDB, S3
 aws ecr delete-repository --repository-name churn-api --force
 aws dynamodb delete-table --table-name churn-model-registry
 aws s3 rb s3://$BUCKET --force
+
+echo "Todos los recursos eliminados."
 ```
 
-> Lo único que cuesta de forma continua es **EC2**: si no la usás, hacé
-> `terminate-instances` (o `stop-instances` para conservarla apagada).
+---
+
+## Resumen del flujo
+
+```
+Paso 0  Verificar AWS CLI y credenciales
+Paso 1  Correr el pipeline en local (opcional, para entender el código)
+Paso 2  Crear S3 + DynamoDB + ECR
+Paso 3  Crear rol IAM para CodeBuild
+Paso 4  Crear proyecto CodeBuild y lanzar el entrenamiento
+Paso 5  Crear rol IAM para EC2
+Paso 6  Lanzar EC2 → la API queda disponible en http://<IP>:8000
+Paso 7  Monitoreo con CloudWatch
+Paso 8  (Opcional) Conectar GitHub Actions
+Paso 9  Teardown
+```
