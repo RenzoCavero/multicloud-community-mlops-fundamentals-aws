@@ -42,9 +42,14 @@ def resolve_version() -> str:
 
 
 def ensure_table(dynamodb) -> None:
-    existing = [t.name for t in dynamodb.tables.all()]
-    if config.DYNAMODB_TABLE in existing:
+    # describe_table (con alcance a la tabla) en vez de ListTables (que exige
+    # Resource "*"), para mantener el permiso IAM al minimo.
+    client = dynamodb.meta.client
+    try:
+        client.describe_table(TableName=config.DYNAMODB_TABLE)
         return
+    except client.exceptions.ResourceNotFoundException:
+        pass
     print(f"[register] creando tabla DynamoDB {config.DYNAMODB_TABLE}...")
     table = dynamodb.create_table(
         TableName=config.DYNAMODB_TABLE,
