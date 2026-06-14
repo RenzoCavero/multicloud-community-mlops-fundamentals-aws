@@ -227,3 +227,5 @@ models/
 reports/
 # Secrets / keys
 *.pem
+# Archivos temporales del laboratorio (JSONs de IAM, user-data, etc.)
+infra/tmp/

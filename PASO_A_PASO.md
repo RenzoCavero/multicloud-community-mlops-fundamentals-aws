@@ -59,8 +59,11 @@ echo "Bucket: $BUCKET"
 # Bucket: churn-mlops-313694531227
 ```
 
-> **Windows Git Bash:** si un argumento empieza con `/` (ARNs, rutas), anteponé
-> `MSYS_NO_PATHCONV=1` al comando para que Git Bash no maniple las rutas.
+> **Windows Git Bash:** los comandos de la guía usan `infra/tmp/` (dentro del
+> repo) para los archivos JSON temporales y los referencian como
+> `file://infra/tmp/archivo.json` (ruta relativa al directorio actual).
+> Ejecutá siempre los comandos desde la raíz del repo.
+> Ni `/tmp/` ni `$TEMP` funcionan con el AWS CLI de Windows desde Git Bash.
 
 ---
 
@@ -99,7 +102,7 @@ S3 es el almacén central del proyecto: guarda el dataset, el feature store, el
 modelo entrenado, los experimentos de MLflow y los reportes de monitoreo.
 
 ```bash
-aws s3api create-bucket --bucket $BUCKET --region $AWS_REGION
+aws s3api create-bucket --bucket $BUCKET --region $AWS_REGION 2>/dev/null || true
 
 # Bloquear acceso público (buena práctica)
 aws s3api put-public-access-block --bucket $BUCKET \
@@ -131,9 +134,10 @@ aws dynamodb create-table \
     AttributeName=model_name,KeyType=HASH \
     AttributeName=version,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST \
-  --region $AWS_REGION
+  --region $AWS_REGION 2>/dev/null || true
 
-# Salida esperada: "TableStatus": "CREATING" → en ~10 segundos pasa a ACTIVE
+# Si la tabla es nueva: "TableStatus": "CREATING" → en ~10 segundos pasa a ACTIVE
+# Si ya existía: el error es ignorado
 ```
 
 ### 2.3 Repositorio ECR (imagen Docker)
@@ -142,9 +146,9 @@ ECR es el registry de imágenes Docker de AWS. La imagen de la API se construye
 una vez y luego EC2 la descarga para correr el contenedor.
 
 ```bash
-aws ecr create-repository --repository-name churn-api --region $AWS_REGION
+aws ecr create-repository --repository-name churn-api --region $AWS_REGION 2>/dev/null || true
 
-# Salida esperada:
+# Salida esperada (primera vez):
 # "repositoryUri": "313694531227.dkr.ecr.us-east-1.amazonaws.com/churn-api"
 ```
 
@@ -157,8 +161,10 @@ el modelo en DynamoDB. Creamos un rol específico con los mínimos permisos
 necesarios (principio de menor privilegio).
 
 ```bash
+mkdir -p infra/tmp
+
 # Política de confianza: quién puede asumir este rol
-cat > /tmp/cb-trust.json <<'EOF'
+cat > infra/tmp/cb-trust.json <<'EOF'
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -169,8 +175,8 @@ cat > /tmp/cb-trust.json <<'EOF'
 }
 EOF
 
-# Permisos del rol
-cat > /tmp/cb-policy.json <<EOF
+# Permisos del rol (las variables $ACCOUNT_ID y $AWS_REGION se expanden aquí)
+cat > infra/tmp/cb-policy.json <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -201,12 +207,12 @@ EOF
 
 aws iam create-role \
   --role-name churn-codebuild-role \
-  --assume-role-policy-document file:///tmp/cb-trust.json
+  --assume-role-policy-document file://infra/tmp/cb-trust.json 2>/dev/null || true
 
 aws iam put-role-policy \
   --role-name churn-codebuild-role \
   --policy-name churn-codebuild-policy \
-  --policy-document file:///tmp/cb-policy.json
+  --policy-document file://infra/tmp/cb-policy.json
 ```
 
 ---
@@ -220,17 +226,18 @@ contenedor Linux gestionado por AWS. Reemplaza SageMaker Training Jobs.
 ### 4.1 Empaquetar y subir el código fuente a S3
 
 ```bash
-git archive --format=zip HEAD -o /tmp/source.zip
-aws s3 cp /tmp/source.zip s3://$BUCKET/source/source.zip
+mkdir -p infra/tmp
+git archive --format=zip HEAD -o infra/tmp/source.zip
+aws s3 cp infra/tmp/source.zip s3://$BUCKET/source/source.zip
 
 # Salida esperada:
-# upload: /tmp/source.zip to s3://churn-mlops-313694531227/source/source.zip
+# upload: infra/tmp/source.zip to s3://churn-mlops-313694531227/source/source.zip
 ```
 
 ### 4.2 Crear el proyecto CodeBuild
 
 ```bash
-cat > /tmp/codebuild.json <<EOF
+cat > infra/tmp/codebuild.json <<EOF
 {
   "name": "churn-training",
   "source": {
@@ -254,8 +261,8 @@ cat > /tmp/codebuild.json <<EOF
 EOF
 
 aws codebuild create-project \
-  --cli-input-json file:///tmp/codebuild.json \
-  --region $AWS_REGION
+  --cli-input-json file://infra/tmp/codebuild.json \
+  --region $AWS_REGION 2>/dev/null || true
 ```
 
 ### 4.3 Lanzar el entrenamiento
@@ -308,7 +315,9 @@ y publicar métricas en CloudWatch. También necesita push a ECR para construir 
 imagen Docker durante el arranque (en producción, esto lo haría GitHub Actions).
 
 ```bash
-cat > /tmp/ec2-trust.json <<'EOF'
+mkdir -p infra/tmp
+
+cat > infra/tmp/ec2-trust.json <<'EOF'
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -319,7 +328,7 @@ cat > /tmp/ec2-trust.json <<'EOF'
 }
 EOF
 
-cat > /tmp/ec2-policy.json <<EOF
+cat > infra/tmp/ec2-policy.json <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -344,23 +353,24 @@ EOF
 
 aws iam create-role \
   --role-name churn-ec2-role \
-  --assume-role-policy-document file:///tmp/ec2-trust.json
+  --assume-role-policy-document file://infra/tmp/ec2-trust.json 2>/dev/null || true
 
 aws iam put-role-policy \
   --role-name churn-ec2-role \
   --policy-name churn-ec2-policy \
-  --policy-document file:///tmp/ec2-policy.json
+  --policy-document file://infra/tmp/ec2-policy.json
 
 # ECR PowerUser: permite que EC2 construya y pushee la imagen Docker
 aws iam attach-role-policy \
   --role-name churn-ec2-role \
-  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser 2>/dev/null || true
 
 # Instance profile: es el "envoltorio" que asocia el rol a la instancia
-aws iam create-instance-profile --instance-profile-name churn-ec2-profile
+aws iam create-instance-profile \
+  --instance-profile-name churn-ec2-profile 2>/dev/null || true
 aws iam add-role-to-instance-profile \
   --instance-profile-name churn-ec2-profile \
-  --role-name churn-ec2-role
+  --role-name churn-ec2-role 2>/dev/null || true
 ```
 
 ---
@@ -379,23 +389,32 @@ Abrimos el puerto 8000 solo a tu IP pública para no exponer la API al mundo.
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 echo "Tu IP: $MY_IP"
 
-SG_ID=$(aws ec2 create-security-group \
+# Crear el security group (si ya existe, el error es ignorado)
+aws ec2 create-security-group \
   --group-name churn-api-sg \
-  --description "API de churn - solo mi IP" \
-  --query 'GroupId' --output text)
+  --description "API de churn - solo mi IP" 2>/dev/null || true
 
+# Obtener el ID (funciona tanto si se acaba de crear como si ya existía)
+SG_ID=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=churn-api-sg" \
+  --query 'SecurityGroups[0].GroupId' --output text)
+echo "Security Group: $SG_ID"
+
+# Agregar la regla de entrada (si ya existe, el error es ignorado)
 aws ec2 authorize-security-group-ingress \
   --group-id $SG_ID \
   --protocol tcp --port 8000 \
-  --cidr $MY_IP/32
+  --cidr $MY_IP/32 2>/dev/null || true
 
-echo "Security Group: $SG_ID"
+echo "Puerto 8000 abierto para $MY_IP"
 ```
 
 ### 6.2 Script de arranque (user-data)
 
 ```bash
-cat > /tmp/user-data.sh <<EOF
+mkdir -p infra/tmp
+
+cat > infra/tmp/user-data.sh <<EOF
 #!/bin/bash
 set -xe
 exec > /var/log/churn-setup.log 2>&1
@@ -428,8 +447,8 @@ EOF
 ### 6.3 Lanzar la instancia
 
 ```bash
-# AMI de Amazon Linux 2023 (última versión, Free Tier)
-AMI=$(aws ssm get-parameter \
+# AMI de Amazon Linux 2023 (MSYS_NO_PATHCONV=1 evita que Git Bash maniple la ruta)
+AMI=$(MSYS_NO_PATHCONV=1 aws ssm get-parameter \
   --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query 'Parameter.Value' --output text)
 
@@ -438,7 +457,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --instance-type t3.micro \
   --iam-instance-profile Name=churn-ec2-profile \
   --security-group-ids $SG_ID \
-  --user-data file:///tmp/user-data.sh \
+  --user-data file://infra/tmp/user-data.sh \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=churn-api}]' \
   --query 'Instances[0].InstanceId' --output text)
 
