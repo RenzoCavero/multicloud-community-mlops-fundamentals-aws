@@ -1,0 +1,39 @@
+# buildspec de AWS CodeBuild = nuestro "training job" (reemplaza SageMaker Training).
+# CodeBuild clona el repo, instala dependencias y ejecuta el pipeline completo.
+# Las variables S3_BUCKET / AWS_REGION se definen en el proyecto de CodeBuild.
+version: 0.2
+
+env:
+  variables:
+    PYTHONPATH: "src"
+    MODEL_TYPE: "logistic-regression"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Instalando dependencias..."
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+
+  build:
+    commands:
+      - echo "== 1. Preprocess =="
+      - python src/preprocess.py
+      - echo "== 2. Feature store (offline CSV) =="
+      - python src/build_feature_store.py
+      - aws s3 cp data/feature_store/features.csv s3://$S3_BUCKET/feature_store/features.csv
+      - echo "== 3. Train (MLflow file store) =="
+      - python src/train.py --model-type $MODEL_TYPE
+      - echo "== 4. Evaluate (quality gate) =="
+      - python src/evaluate.py
+      - echo "== 5. Register model (S3 + DynamoDB) =="
+      - python infra/register_model.py
+
+  post_build:
+    commands:
+      # Subir el historial de experimentos MLflow a S3 (tracking persistente)
+      - echo "Subiendo MLflow runs a S3..."
+      - aws s3 sync mlruns s3://$S3_BUCKET/mlruns/ --quiet || true
+      - echo "Entrenamiento y registro completados."

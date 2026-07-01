@@ -1,0 +1,55 @@
+flowchart TD
+    DEV([Developer]) -->|push| GH[GitHub Repository]
+
+    subgraph CICD[CI/CD - GitHub Actions]
+        GH -->|push/PR| CI[ci.yml: ruff + pytest]
+        GH -->|manual trigger| TRAIN_WF[train-codebuild.yml: start-build]
+        GH -->|push main| DOCKER_WF[docker-ecr.yml: docker build + push]
+    end
+
+    subgraph TRAINING[Entrenamiento - AWS CodeBuild]
+        TRAIN_WF --> CB[CodeBuild churn-training]
+        CB --> P1[preprocess.py]
+        P1 --> P2[build_feature_store.py]
+        P2 --> P3[train.py + MLflow]
+        P3 --> P4{evaluate.py quality gate}
+        P4 -->|PASS| P5[register_model.py]
+        P4 -->|FAIL| FAIL[Build failed]
+    end
+
+    subgraph STORAGE[Storage + Registry]
+        S3[(Amazon S3: raw, feature_store, models, mlruns, reports)]
+        DDB[(Amazon DynamoDB: churn-model-registry)]
+        ECR[Amazon ECR: churn-api image]
+    end
+
+    subgraph INFERENCE[Deploy + Inferencia]
+        EC2[Amazon EC2 t3.micro + Docker]
+        API[FastAPI: health, predict, batch, docs]
+        INF[inference.py]
+        CLIENT([Cliente / Usuario])
+    end
+
+    subgraph MONITOR[Monitoreo]
+        PRED[predict.py batch scoring]
+        MON[monitor.py drift/PSI]
+        CW[Amazon CloudWatch metrics/logs]
+    end
+
+    P2 -->|upload feature store| S3
+    P3 -->|sync mlruns| S3
+    P5 -->|upload model and metrics| S3
+    P5 -->|put item Production| DDB
+    CB -->|logs| CW
+    DOCKER_WF -->|push image| ECR
+    ECR -->|pull image| EC2
+    EC2 --> API
+    API --> INF
+    INF -->|query Production| DDB
+    INF -->|download model.joblib| S3
+    CLIENT -->|POST /predict| API
+    API -->|prediction| CLIENT
+    CLIENT --> PRED
+    PRED --> MON
+    MON --> CW
+    MON -->|report JSON| S3
