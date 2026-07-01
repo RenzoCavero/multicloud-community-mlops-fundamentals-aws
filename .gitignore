@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-specific ──────────────────────────────────────────────
+# MLflow local file store
+mlruns/
+# Pipeline artifacts (generated locally; the real ones live in S3)
+data/processed/
+data/feature_store/
+models/
+reports/
+# Secrets / keys
+*.pem
+# Archivos temporales del laboratorio (JSONs de IAM, user-data, etc.)
+infra/tmp/
